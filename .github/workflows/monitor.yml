@@ -1,0 +1,40 @@
+name: news-monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # 15分おき
+  workflow_dispatch:          # 手動実行ボタン
+
+permissions:
+  contents: write
+
+concurrency:
+  group: news-monitor
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Monitor feeds
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+        run: python monitor.py
+
+      - name: Save seen list
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898699+github-actions[bot]@users.noreply.github.com"
+          git add seen.json
+          git diff --staged --quiet || (git commit -m "update seen" && git push)
