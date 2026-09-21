@@ -1,12 +1,23 @@
 """
-SUIKYO 当局一次情報モニター
+SUIKYO 当局一次情報モニター（v2）
 RSSを監視 → 新着だけを日本語要約 → Discord に通知（X投稿案つき）
+
+v2 の変更点
+ 1. 公表から MAX_AGE_HOURS 以上経った項目は送らない（既読扱いにして捨てる）
+ 2. 国内ソースは「要約」、海外ソースは「非公式訳」と表記を分ける
+ 3. 定例統計などをタイトルのキーワードで除外（API費用もかからない）
+    重要度「低」と判定されたものも送らない
+ 4. PDF記事は本文を無理に読まず、AIに「書かれていないことを補うな」と明示
+ 5. 要約の数値ルールを追加（概数は四捨五入＋「約」）
+ 6. 通知に公表日時を表示
 """
 import os
 import re
 import json
 import time
 import hashlib
+import calendar
+from datetime import datetime, timezone, timedelta
 
 import requests
 import feedparser
@@ -20,7 +31,10 @@ MODEL = "claude-haiku-4-5-20251001"   # 安価・高速モデル
 STATE_FILE = "seen.json"
 MAX_PER_RUN = 8        # 1回の実行で処理する上限（API費用の暴走防止）
 KEEP = 300             # フィードごとに覚えておく既読件数
+MAX_AGE_HOURS = 48     # これより古い公表は送らない
+SEND_LOW = False       # 重要度「低」も送るなら True
 HEADERS = {"User-Agent": f"SUIKYO news-monitor {CONTACT}"}
+JST = timezone(timedelta(hours=9))
 
 # (表示名, RSS URL, 投稿に添えるライセンス表記。空欄＝表記不要)
 FEEDS = [
@@ -38,14 +52,33 @@ FEEDS = [
     ("豪準備銀行",  "https://www.rba.gov.au/rss/rss-cb-media-releases.xml", "CC BY 4.0"),
 ]
 
+# 原文が日本語のソース（「非公式訳」ではなく「要約」と表記）
+DOMESTIC = {"日本銀行", "金融庁"}
+
+# タイトルにこれを含むものは送らない（Xで反応が取れない定例物）
+EXCLUDE_KEYWORDS = [
+    # 日本銀行の定例統計・定例公表
+    "営業毎旬報告", "レポ統計", "資金循環", "時系列統計", "マネタリーベース",
+    "預金・貸出", "貸出・預金", "企業物価指数", "サービス価格指数",
+    "決済動向", "オペレーション", "国債買入", "共通担保", "補完当座預金",
+    "日本銀行勘定", "統計の公表予定", "公表予定",
+    # 金融庁の定例物
+    "パブリックコメントの結果", "説明会", "意見交換会", "採用",
+    # 海外（人事・イベント告知系）
+    "Speech by", "speaks at", "Board meeting", "Minutes of the Board",
+    "vacancy", "Job ", "Careers",
+]
+
 SYSTEM = """あなたは各国の金融当局・政府機関の公表文を日本語で正確に要約する編集者です。
 規則:
-- 公表文に書かれている事実のみを書く。推測・相場予想・投資判断・売買推奨は一切書かない
-- 数値・日付・固有名詞は原文どおり正確に
+- 与えられた本文に書かれている事実のみを書く。本文にない内容を補ったり、一般論で埋めたりしない
+- 本文が不十分な場合は、タイトルから確実に言えることだけを書き、summary の最後の行に「・詳細は原文参照」と書く
+- 推測・相場予想・投資判断・売買推奨は一切書かない
+- 数値・日付・固有名詞は原文どおり正確に。概数にする場合は四捨五入し「約」を付ける（例: 519兆5,238億円→約520兆円）
 - 原文をそのまま訳さず、要点を自分の構成でまとめる
 出力は次のJSONのみ。前置き・コードブロックは禁止:
 {"importance":"高|中|低","headline":"30字以内の日本語見出し","summary":"要点3〜5行。各行は「・」で始め改行で区切る","x_post":"X投稿用本文。70字以内。見出しと要点1点。URLは含めない"}
-重要度: 高=政策金利・主要経済指標・大型規制や処分 / 中=通常の政策発表・報告書 / 低=人事・イベント告知・定型公表"""
+重要度: 高=政策金利・主要経済指標・大型規制や処分・当局トップの政策発言 / 中=通常の政策発表・報告書・災害時の金融措置 / 低=人事・イベント告知・定型公表・定例統計"""
 
 ICON = {"高": "🔴", "中": "🟡", "低": "⚪"}
 
@@ -69,6 +102,27 @@ def entry_id(e):
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def entry_date(e):
+    """公表日時（UTC）を返す。RSSに日付が無ければURL中の yymmdd から推定。不明なら None"""
+    for key in ("published_parsed", "updated_parsed"):
+        t = e.get(key)
+        if t:
+            return datetime.fromtimestamp(calendar.timegm(t), tz=timezone.utc)
+    # 例: fso260821a.pdf / ac260820.htm → 2026-08-21 / 2026-08-20
+    for m in re.finditer(r"(?<!\d)(2\d)(\d{2})(\d{2})(?!\d)", e.get("link", "")):
+        try:
+            d = datetime(2000 + int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=JST)
+            return d.astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def is_excluded(e):
+    title = e.get("title", "")
+    return any(k.lower() in title.lower() for k in EXCLUDE_KEYWORDS)
+
+
 def fetch_feed(url):
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
@@ -79,21 +133,24 @@ def fetch_feed(url):
 
 
 def fetch_text(entry):
-    """記事本文を取得。失敗したらRSSの概要で代用"""
+    """記事本文を取得。PDFや取得失敗時はRSSの概要で代用し、その旨を明記"""
     fallback = BeautifulSoup(entry.get("summary", ""), "html.parser").get_text(" ", strip=True)
-    link = entry.get("link")
-    if not link:
-        return fallback
+    note = "\n\n（注意：本文は取得できていません。上記の概要とタイトルのみを根拠にし、書かれていない内容を補わないこと）"
+    link = entry.get("link", "")
+    if not link or link.lower().endswith(".pdf"):
+        return (fallback or "（概要なし）") + note
     try:
         r = requests.get(link, headers=HEADERS, timeout=20)
         r.raise_for_status()
+        if "pdf" in r.headers.get("Content-Type", "").lower():
+            return (fallback or "（概要なし）") + note
         soup = BeautifulSoup(r.text, "html.parser")
         for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
             tag.decompose()
         text = soup.get_text(" ", strip=True)
-        return text[:8000] if len(text) > 200 else fallback
+        return text[:8000] if len(text) > 200 else (fallback or "（概要なし）") + note
     except Exception:
-        return fallback
+        return (fallback or "（概要なし）") + note
 
 
 def summarize(client, source, entry, body):
@@ -117,14 +174,19 @@ def post_discord(content):
     time.sleep(1)
 
 
-def build_message(source, lic, entry, s):
+def fmt_date(d):
+    return d.astimezone(JST).strftime("%m/%d %H:%M") + " JST" if d else "日付不明・要確認"
+
+
+def build_message(source, lic, entry, s, d):
     link = entry.get("link", "")
+    label = "要約" if source in DOMESTIC else "非公式訳"
     credit = f"出典:{source}" + (f"（{lic}）" if lic else "")
-    x_text = f"{s['x_post']}\n\n{credit}｜非公式訳\n{link}"
+    x_text = f"{s['x_post']}\n\n{credit}｜{label}\n{link}"
     return (
         f"{ICON.get(s.get('importance'), '⚪')} **{s['headline']}**\n"
-        f"{source}\n\n{s['summary']}\n\n"
-        f"**X投稿案**\n```\n{x_text}\n```"
+        f"{source}｜公表 {fmt_date(d)}\n\n{s['summary']}\n\n"
+        f"**X投稿案**（数字は原文と照合してから投稿）\n```\n{x_text}\n```"
     )
 
 
@@ -132,7 +194,10 @@ def build_message(source, lic, entry, s):
 def main():
     state = load_state()
     client = anthropic.Anthropic()
+    now = datetime.now(timezone.utc)
+    limit = now - timedelta(hours=MAX_AGE_HOURS)
     candidates, initialized, failed = [], [], []
+    skipped_old = skipped_kw = skipped_low = 0
 
     for source, url, lic in FEEDS:
         try:
@@ -151,8 +216,19 @@ def main():
 
         seen = set(state[url])
         for e, eid in zip(reversed(entries), reversed(ids)):   # 古い順
-            if eid not in seen:
-                candidates.append((url, source, lic, e, eid))
+            if eid in seen:
+                continue
+            d = entry_date(e)
+            # 古い・除外対象は API を使わず既読にして捨てる
+            if d and d < limit:
+                skipped_old += 1
+                state[url] = ([eid] + state[url])[:KEEP]
+                continue
+            if is_excluded(e):
+                skipped_kw += 1
+                state[url] = ([eid] + state[url])[:KEEP]
+                continue
+            candidates.append((url, source, lic, e, eid, d))
 
     if initialized:
         note = f"✅ 監視を開始しました：{'、'.join(initialized)}"
@@ -160,13 +236,18 @@ def main():
             note += f"\n⚠️ 取得できなかったフィード：{'、'.join(failed)}"
         post_discord(note)
 
-    for url, source, lic, e, eid in candidates[:MAX_PER_RUN]:
+    for url, source, lic, e, eid, d in candidates[:MAX_PER_RUN]:
         try:
             s = summarize(client, source, e, fetch_text(e))
-            content = build_message(source, lic, e, s)
+            if s.get("importance") == "低" and not SEND_LOW:
+                skipped_low += 1
+                state[url] = ([eid] + state[url])[:KEEP]
+                continue
+            content = build_message(source, lic, e, s, d)
         except Exception as ex:
             print(f"[要約失敗] {source}: {ex}")
-            content = f"⚪ **{e.get('title', '(無題)')}**\n{source}（要約失敗・原文を確認）\n{e.get('link', '')}"
+            content = (f"⚪ **{e.get('title', '(無題)')}**\n{source}｜公表 {fmt_date(d)}"
+                       f"（要約失敗・原文を確認）\n{e.get('link', '')}")
         try:
             post_discord(content)
         except Exception as ex:
@@ -175,7 +256,8 @@ def main():
         state[url] = ([eid] + state[url])[:KEEP]
 
     save_state(state)
-    print(f"新着 {len(candidates)} 件 / 処理 {min(len(candidates), MAX_PER_RUN)} 件")
+    print(f"新着 {len(candidates)} 件 / 処理 {min(len(candidates), MAX_PER_RUN)} 件 / "
+          f"除外: 古い {skipped_old}・定例 {skipped_kw}・重要度低 {skipped_low}")
 
 
 if __name__ == "__main__":
