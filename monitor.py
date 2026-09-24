@@ -165,9 +165,12 @@ def summarize(client, source, entry, body):
             "content": f"発表元: {source}\nタイトル: {entry.get('title', '')}\n\n本文:\n{body}",
         }],
     )
-    text = "".join(b.text for b in msg.content if b.type == "text")
-    text = re.sub(r"```(json)?", "", text).strip()
-    return json.loads(text)
+    text = "".join(b.text for b in msg.content if b.type == "text").strip()
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        print(f"[生出力] {text[:300]!r}")
+        raise ValueError("JSONが見つかりません")
+    return json.loads(m.group(0))
 
 
 def post_discord(content):
