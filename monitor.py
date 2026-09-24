@@ -139,6 +139,8 @@ def fetch_text(entry):
     fallback = BeautifulSoup(entry.get("summary", ""), "html.parser").get_text(" ", strip=True)
     note = "\n\n（注意：本文は取得できていません。上記の概要とタイトルのみを根拠にし、書かれていない内容を補わないこと）"
     link = entry.get("link", "")
+     if link and link.lower().endswith(".pdf"):
+        return ""
     if not link or link.lower().endswith(".pdf"):
         return (fallback or "（概要なし）") + note
     try:
@@ -243,7 +245,10 @@ def main():
 
     for url, source, lic, e, eid, d in candidates[:MAX_PER_RUN]:
         try:
-            s = summarize(client, source, e, fetch_text(e))
+                     body = fetch_text(e)
+            if not body.strip():
+                raise ValueError("本文取得不可（PDF等）")
+            s = summarize(client, source, e, body)
             if s.get("importance") == "低" and not SEND_LOW:
                 skipped_low += 1
                 state[url] = ([eid] + state[url])[:KEEP]
