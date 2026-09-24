@@ -158,7 +158,7 @@ def fetch_text(entry):
 def summarize(client, source, entry, body):
     msg = client.messages.create(
         model=MODEL,
-        max_tokens=800,
+        max_tokens=2000,
         system=SYSTEM,
         messages=[{
             "role": "user",
