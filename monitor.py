@@ -27,7 +27,7 @@ from bs4 import BeautifulSoup
 # ===== 設定 =====
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 CONTACT = os.environ.get("CONTACT_EMAIL") or "noreply@example.com"
-MODEL = "claude-haiku-4-5-20251001"   # 安価・高速モデル
+MODEL = "claude-sonnet-5"   # 数値の精度重視
 STATE_FILE = "seen.json"
 MAX_PER_RUN = 8        # 1回の実行で処理する上限（API費用の暴走防止）
 KEEP = 300             # フィードごとに覚えておく既読件数
