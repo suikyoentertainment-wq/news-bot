@@ -100,7 +100,9 @@ def save_state(state):
 
 
 def entry_id(e):
-    raw = e.get("id") or e.get("link") or e.get("title", "")
+    raw = (e.get("title") or "").strip()
+    if not raw:
+        raw = e.get("id") or e.get("link") or ""
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
